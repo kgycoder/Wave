@@ -1227,6 +1227,7 @@ initYt();
 ════════════════════════════════════════════ */
 let _sugTimer = null;
 let _sugSeq = 0;            // 추천어 요청 세대 번호 (검색 실행 시 올려서 늦게 도착한 응답을 무효화)
+let _searchSeq = 0;
 let _lastSearchedQ = '';    // 방금 실행한 검색어 (같은 검색어로는 추천 박스를 다시 열지 않음)
 document.addEventListener('mousedown', e => {
     const item = e.target.closest('.sug-item');
@@ -1279,12 +1280,12 @@ function hideSug(id) { document.getElementById(id)?.classList.remove('on'); }
 const _YR = new Date().getFullYear();
 const _qc = new Map();   // 메모리 TTL 캐시 — 홈/검색의 중복 요청과 재렌더 때의 재요청 제거
 function cachedCall(p, ttl = 900000) {
-    const k = p.type + '|' + (p.kind || '') + '|' + (p.query || p.videoId || p.browseId || '') + '|' + (p.country || '');
+    const k = p.type + '|' + (p.kind || '') + '|' + (p.query || p.videoId || p.browseId || '') + '|' + (p.country || '') + '|' + (p.deep ? 'd' : '');
     const h = _qc.get(k);
     if (h && Date.now() - h.at < ttl) return h.p;
     const pr = callCs({ ...p });
     _qc.set(k, { at: Date.now(), p: pr });
-    if (_qc.size > 80) _qc.delete(_qc.keys().next().value);
+    if (_qc.size > 50) _qc.delete(_qc.keys().next().value);
     pr.catch(() => { if (_qc.get(k)?.p === pr) _qc.delete(k); });
     return pr;
 }
@@ -1411,7 +1412,9 @@ function mkSongRow(t, playFn, numbered) {
 }
 function _songList(tracks, numbered) {
     const box = document.createElement('div'); box.className = 'mi-list';
-    tracks.forEach((t, i) => box.appendChild(mkSongRow(t, () => { S.q = tracks; S.idx = i; playTrack(t, i); }, numbered ? i + 1 : 0)));
+    const fr = document.createDocumentFragment();   // 한 번에 붙여 레이아웃 1회
+    tracks.forEach((t, i) => fr.appendChild(mkSongRow(t, () => { S.q = tracks; S.idx = i; playTrack(t, i); }, numbered ? i + 1 : 0)));
+    box.appendChild(fr);
     return box;
 }
 
@@ -1461,20 +1464,25 @@ async function doSearch(query) {
     const area = document.getElementById('s-res');
     area.innerHTML = `<div class="state"><div class="spinner"></div><p style="margin-top:12px">검색 중...</p></div>`;
     _sStack.length = 0; _sRender = null; _miMode(false);
-    /* 영상 검색(기존 그대로: 쿼리에 키워드를 덧붙이지 않음)과 곡/아티스트/앨범 검색을 동시에 요청 */
-    const mq = kind => cachedCall({ type: 'musicSearch', kind, query: q }, 300000);
-    const [vr, sr, ar, br] = await Promise.allSettled([
-        cachedCall({ type: 'search', query: q }, 300000), mq('song'), mq('artist'), mq('album')]);
-    const songs = sr.status === 'fulfilled' ? (sr.value.items || []) : [];
-    const sid = new Set(songs.map(t => t.id));
+    /* 실제로 등록된 음악(싱글/EP/앨범 수록곡)만 검색: YTM 카탈로그 + iTunes + Deezer 병합(deep).
+       일반 영상 검색은 위 결과가 전부 비었을 때만 폴백으로 사용한다. */
+    const my = ++_searchSeq;
+    const mq = (kind, deep) => cachedCall({ type: 'musicSearch', kind, query: q, deep: deep ? 1 : 0 }, 300000);
+    const [sr, ar, br] = await Promise.allSettled([mq('song', 1), mq('artist'), mq('album', 1)]);
+    if (my !== _searchSeq) return;   // 더 새로운 검색이 시작됨
     const d = {
-        songs,
+        songs: sr.status === 'fulfilled' ? (sr.value.items || []) : [],
         artists: ar.status === 'fulfilled' ? (ar.value.items || []) : [],
         albums: br.status === 'fulfilled' ? (br.value.items || []) : [],
-        videos: vr.status === 'fulfilled' ? sortMusicFirst(vr.value.tracks || []).filter(t => !sid.has(t.id)) : []
+        videos: []
     };
+    let err = '';
+    if (!d.songs.length && !d.artists.length && !d.albums.length) {
+        try { const vr = await cachedCall({ type: 'search', query: q }, 300000); d.videos = sortMusicFirst(vr.tracks || []); }
+        catch (e) { err = e?.message || ''; }
+        if (my !== _searchSeq) return;
+    }
     if (!d.songs.length && !d.artists.length && !d.albums.length && !d.videos.length) {
-        const err = vr.status === 'rejected' ? vr.reason?.message : '';
         area.innerHTML = err ? `<div class="state"><h3>검색 실패</h3><p>${esc(err)}</p></div>`
             : `<div class="state"><h3>결과 없음</h3><p>다른 검색어를 시도해보세요</p></div>`;
         return;
@@ -1486,10 +1494,14 @@ async function doSearch(query) {
 /* ── 아티스트 / 앨범 상세 ── */
 async function _miFallback(kind, id, hint) {
     if (!hint?.name) return null;
+    const nz = x => (x || '').toLowerCase().replace(/\s[-–]\s*(single|ep)\s*$/i, '').replace(/[^\p{L}\p{N}]+/gu, '');
     const q = [hint.name, kind === 'album' ? hint.artist : ''].filter(Boolean).join(' ');
     const r = await cachedCall({ type: 'musicSearch', kind, query: q }, 300000);
-    const nm = hint.name.trim().toLowerCase();
-    const it = (r.items || []).find(x => x.id !== id && (x.name || '').trim().toLowerCase() === nm);
+    const nm = nz(hint.name), ar = nz((hint.artist || '').split(',')[0]);
+    const list = (r.items || []).filter(x => x.id !== id);
+    const it = list.find(x => nz(x.name) === nm && (!ar || !x.artist || nz(x.artist).includes(ar) || ar.includes(nz(x.artist).slice(0, 4))))
+        || list.find(x => nz(x.name) === nm)
+        || list.find(x => nz(x.name).startsWith(nm) || nm.startsWith(nz(x.name)));
     return it ? cachedCall({ type: 'musicBrowse', browseId: it.id }) : null;
 }
 async function miOpen(kind, id, hint) {
@@ -2377,6 +2389,7 @@ initSeekBar('np-lv-pb', 'np-lv-pf');
 /* ════════════════════════════════════════════
    TICK
 ════════════════════════════════════════════ */
+let _tickEls = null;
 function startTick() {
     stopTick();
     let _bgTickN = 0;
@@ -2393,10 +2406,11 @@ function startTick() {
             }
             if (window.__bgMode) { syncMediaSession(true); return; }   // 백그라운드: DOM 갱신 생략
             const pct = S.dur ? (S.cur / S.dur) * 100 : 0;
-            const pb = document.getElementById('pb');
-            const npb = document.getElementById('np-pb');
-            const ovb = document.getElementById('ov-pb');
-            const lvpb = document.getElementById('np-lv-pb');
+            const E = _tickEls || (_tickEls = {   // 250ms 마다 getElementById 반복 제거
+                pb: document.getElementById('pb'), npb: document.getElementById('np-pb'),
+                ovb: document.getElementById('ov-pb'), lvpb: document.getElementById('np-lv-pb'),
+                bpf: document.getElementById('bar-prog-fill') });
+            const pb = E.pb, npb = E.npb, ovb = E.ovb, lvpb = E.lvpb;
             if (!pb?.classList.contains('dragging')) pb?._setFill?.(pct);
             if (!npb?.classList.contains('dragging')) npb?._setFill?.(pct);
             if (OV.active && !ovb?.classList.contains('dragging')) ovb?._setFill?.(pct);
@@ -2404,7 +2418,7 @@ function startTick() {
             setT('p-cur', S.cur); setT('np-cur', S.cur);
             setT('p-tot', S.dur); setT('np-tot', S.dur);
             if (OV.active) { setT('ov-p-cur', S.cur); setT('ov-p-tot', S.dur); }
-            const bpf = document.getElementById('bar-prog-fill');
+            const bpf = E.bpf;
             if (bpf) bpf.style.width = pct.toFixed(2) + '%';
             syncMediaSession(true);
         } catch { }
