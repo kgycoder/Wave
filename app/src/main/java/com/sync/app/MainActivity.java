@@ -126,8 +126,31 @@ public class MainActivity extends AppCompatActivity {
 
     private final OkHttpClient http = new OkHttpClient.Builder()
             .followRedirects(true)
+            .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
             .build();
+    /** 카탈로그(iTunes/Deezer) 조회용 — 느린 외부 API 가 검색을 붙잡지 않도록 호출 전체 시간 제한 */
+    private final OkHttpClient httpFast = http.newBuilder()
+            .callTimeout(3500, java.util.concurrent.TimeUnit.MILLISECONDS).build();
     private final ExecutorService executor = Executors.newFixedThreadPool(6);
+    /** 검색 하위 작업 전용(executor 스레드가 하위 작업을 기다리다 굶는 교착 방지) */
+    private final ExecutorService subPool = Executors.newCachedThreadPool();
+    private MusicCatalog catalogRef;
+
+    private synchronized MusicCatalog catalog() {
+        if (catalogRef == null) catalogRef = new MusicCatalog(new MusicCatalog.Host() {
+            @Override public JSONArray ytm(String q, String kind) throws Exception { return ytmSearchItems(q, kind); }
+            @Override public JSONObject browse(String id) throws Exception { return ytmBrowseData(id, ""); }
+            @Override public String get(String url, int ms) throws Exception {
+                Request r = new Request.Builder().url(url).header("User-Agent", "SYNC/1.0 (Android)").build();
+                try (Response resp = httpFast.newCall(r).execute()) {
+                    if (!resp.isSuccessful() || resp.body() == null) throw new IOException("HTTP " + resp.code());
+                    return readUtf8(resp);
+                }
+            }
+        }, subPool);
+        return catalogRef;
+    }
 
 
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
@@ -648,15 +671,38 @@ public class MainActivity extends AppCompatActivity {
             ".*\\d.*(회|views|plays|구독자|subscribers|곡|songs|분|min).*", Pattern.CASE_INSENSITIVE);
 
     /** 일시적인 400/5xx/네트워크 오류는 한 번 재시도 */
-    private String ytmCall(String ep, JSONObject body) throws Exception {
-        try { return ytmCallOnce(ep, body); }
-        catch (IOException e) { Thread.sleep(300); return ytmCallOnce(ep, body); }
+    private volatile String ytmGoodVer = null;
+
+    /** 클라이언트 버전이 오래되면 YTM 이 HTTP 400 으로 거부한다 → 최근 날짜 기반 버전을 우선 사용하고 동작한 버전을 기억 */
+    private static String ytmDynVer() {
+        java.util.Calendar c = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+        c.add(java.util.Calendar.DAY_OF_YEAR, -2);
+        return String.format(java.util.Locale.US, "1.%04d%02d%02d.01.00",
+                c.get(java.util.Calendar.YEAR), c.get(java.util.Calendar.MONTH) + 1, c.get(java.util.Calendar.DAY_OF_MONTH));
     }
 
-    private String ytmCallOnce(String ep, JSONObject body) throws Exception {
+    /** 일시적인 5xx/네트워크 오류는 한 번 재시도, 400 은 (버전이 아직 확정되지 않았다면) 다른 클라이언트 버전으로 재시도 */
+    private String ytmCall(String ep, JSONObject body) throws Exception {
+        String good = ytmGoodVer;
+        String[] vs = good != null ? new String[]{good} : new String[]{ytmDynVer(), YTM_VER};
+        IOException last = null;
+        for (String v : vs) {
+            for (int a = 0; a < 2; a++) {
+                try { String r = ytmCallOnce(ep, body, v); ytmGoodVer = v; return r; }
+                catch (IOException e) {
+                    last = e;
+                    if (String.valueOf(e.getMessage()).equals("HTTP 400")) break;
+                    Thread.sleep(250);
+                }
+            }
+        }
+        throw last != null ? last : new IOException("YTM");
+    }
+
+    private String ytmCallOnce(String ep, JSONObject body, String ver) throws Exception {
         JSONObject client = new JSONObject();
         client.put("clientName", "WEB_REMIX");
-        client.put("clientVersion", YTM_VER);
+        client.put("clientVersion", ver);
         client.put("hl", "ko");
         client.put("gl", "KR");
         body.put("context", new JSONObject().put("client", client));
@@ -665,7 +711,7 @@ public class MainActivity extends AppCompatActivity {
                 .post(RequestBody.create(body.toString(),
                         MediaType.parse("application/json; charset=utf-8")))
                 .addHeader("X-YouTube-Client-Name", "67")
-                .addHeader("X-YouTube-Client-Version", YTM_VER)
+                .addHeader("X-YouTube-Client-Version", ver)
                 .addHeader("Origin", "https://music.youtube.com")
                 .addHeader("Referer", "https://music.youtube.com/")
                 .addHeader("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.8")
@@ -888,27 +934,38 @@ public class MainActivity extends AppCompatActivity {
         } catch (JSONException ignored) {}
     }
 
+    private JSONArray ytmSearchItems(String query, String kind) throws Exception {
+        String p = kind.equals("artist") ? "EgWKAQIgAWoMEA4QChADEAQQCRAF"
+                 : kind.equals("album")  ? "EgWKAQIYAWoMEA4QChADEAQQCRAF"
+                                         : "EgWKAQIIAWoMEA4QChADEAQQCRAF";
+        JSONObject body = new JSONObject();
+        body.put("query", query);
+        body.put("params", p);
+        JSONObject doc = new JSONObject(ytmCall("search", body));
+        JSONArray out = new JSONArray();
+        java.util.HashSet<String> seen = new java.util.HashSet<>();
+        for (Object o : ytmFind(doc, "musicResponsiveListItemRenderer")) {
+            if (!(o instanceof JSONObject)) continue;
+            JSONObject it = ytmList((JSONObject) o);
+            if (it == null || !it.optString("kind").equals(kind)) continue;
+            if (!seen.add(it.optString("id"))) continue;
+            out.put(it);
+            if (out.length() >= 20) break;
+        }
+        return out;
+    }
+
     private void doMusicSearch(JSONObject msg) {
         String id = msg.optString("id", "0");
         try {
             String kind = msg.optString("kind", "song");
-            String p = kind.equals("artist") ? "EgWKAQIgAWoMEA4QChADEAQQCRAF"
-                     : kind.equals("album")  ? "EgWKAQIYAWoMEA4QChADEAQQCRAF"
-                                             : "EgWKAQIIAWoMEA4QChADEAQQCRAF";
-            JSONObject body = new JSONObject();
-            body.put("query", msg.optString("query"));
-            body.put("params", p);
-            JSONObject doc = new JSONObject(ytmCall("search", body));
-            JSONArray out = new JSONArray();
-            java.util.HashSet<String> seen = new java.util.HashSet<>();
-            for (Object o : ytmFind(doc, "musicResponsiveListItemRenderer")) {
-                if (!(o instanceof JSONObject)) continue;
-                JSONObject it = ytmList((JSONObject) o);
-                if (it == null || !it.optString("kind").equals(kind)) continue;
-                if (!seen.add(it.optString("id"))) continue;
-                out.put(it);
-                if (out.length() >= 20) break;
-            }
+            String q = msg.optString("query");
+            JSONArray out;
+            if (msg.optBoolean("deep") && (kind.equals("song") || kind.equals("album"))) {
+                // 카탈로그(iTunes·Deezer) + YTM 병합 검색. 어떤 이유로든 실패하면 기존 YTM 검색으로 폴백
+                try { out = kind.equals("song") ? catalog().searchSongs(q) : catalog().searchAlbums(q); }
+                catch (Exception e) { out = ytmSearchItems(q, kind); }
+            } else out = ytmSearchItems(q, kind);
             JSONObject res = new JSONObject();
             res.put("items", out);
             ytmSend(id, res, null);
@@ -917,10 +974,14 @@ public class MainActivity extends AppCompatActivity {
 
     private void doMusicBrowse(JSONObject msg) {
         String id = msg.optString("id", "0");
-        try {
+        try { ytmSend(id, ytmBrowseData(msg.optString("browseId"), msg.optString("country", "")), null); }
+        catch (Exception e) { ytmSend(id, null, String.valueOf(e.getMessage())); }
+    }
+
+    private JSONObject ytmBrowseData(String browseId, String country) throws Exception {
+        {
             JSONObject body = new JSONObject();
-            body.put("browseId", msg.optString("browseId"));
-            String country = msg.optString("country", "");
+            body.put("browseId", browseId);
             if (!country.isEmpty())
                 body.put("formData", new JSONObject().put("selectedValues", new JSONArray().put(country)));
             JSONObject doc = new JSONObject(ytmCall("browse", body));
@@ -983,8 +1044,8 @@ public class MainActivity extends AppCompatActivity {
                 sections.put(sec);
             }
             res.put("sections", sections);
-            ytmSend(id, res, null);
-        } catch (Exception e) { ytmSend(id, null, String.valueOf(e.getMessage())); }
+            return res;
+        }
     }
 
     /** 한 곡 기준 연관곡(라디오). 첫 항목은 해당 곡 자신(앨범/아티스트 메타 포함). */
