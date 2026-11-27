@@ -671,9 +671,9 @@ public class MainActivity extends AppCompatActivity {
             ".*\\d.*(회|views|plays|구독자|subscribers|곡|songs|분|min).*", Pattern.CASE_INSENSITIVE);
 
     /** 일시적인 400/5xx/네트워크 오류는 한 번 재시도 */
-    private volatile String ytmGoodVer = null;
+    private final java.util.concurrent.ConcurrentHashMap<String, String> ytmGoodVer = new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** 클라이언트 버전이 오래되면 YTM 이 HTTP 400 으로 거부한다 → 최근 날짜 기반 버전을 우선 사용하고 동작한 버전을 기억 */
+    /** 400 대응용 날짜 기반 클라이언트 버전 */
     private static String ytmDynVer() {
         java.util.Calendar c = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
         c.add(java.util.Calendar.DAY_OF_YEAR, -2);
@@ -681,14 +681,14 @@ public class MainActivity extends AppCompatActivity {
                 c.get(java.util.Calendar.YEAR), c.get(java.util.Calendar.MONTH) + 1, c.get(java.util.Calendar.DAY_OF_MONTH));
     }
 
-    /** 일시적인 5xx/네트워크 오류는 한 번 재시도, 400 은 (버전이 아직 확정되지 않았다면) 다른 클라이언트 버전으로 재시도 */
+    /** 기존(검증된) 버전을 먼저 쓰고, 400 이면 날짜 버전으로 재시도. 엔드포인트별로 동작한 버전을 기억 */
     private String ytmCall(String ep, JSONObject body) throws Exception {
-        String good = ytmGoodVer;
-        String[] vs = good != null ? new String[]{good} : new String[]{ytmDynVer(), YTM_VER};
+        String good = ytmGoodVer.get(ep);
+        String[] vs = good != null ? new String[]{good} : new String[]{YTM_VER, ytmDynVer()};
         IOException last = null;
         for (String v : vs) {
             for (int a = 0; a < 2; a++) {
-                try { String r = ytmCallOnce(ep, body, v); ytmGoodVer = v; return r; }
+                try { String r = ytmCallOnce(ep, body, v); ytmGoodVer.put(ep, v); return r; }
                 catch (IOException e) {
                     last = e;
                     if (String.valueOf(e.getMessage()).equals("HTTP 400")) break;
@@ -698,6 +698,9 @@ public class MainActivity extends AppCompatActivity {
         }
         throw last != null ? last : new IOException("YTM");
     }
+
+    /** 특정 버전으로 한 번만 호출 (결과가 비었을 때 다른 버전으로 재시도용) */
+    private String ytmCallWith(String ep, JSONObject body, String ver) throws Exception { return ytmCallOnce(ep, body, ver); }
 
     private String ytmCallOnce(String ep, JSONObject body, String ver) throws Exception {
         JSONObject client = new JSONObject();
@@ -941,7 +944,19 @@ public class MainActivity extends AppCompatActivity {
         JSONObject body = new JSONObject();
         body.put("query", query);
         body.put("params", p);
-        JSONObject doc = new JSONObject(ytmCall("search", body));
+        JSONArray out = ytmParseSearch(new JSONObject(ytmCall("search", body)), kind);
+        if (out.length() == 0) {   // 응답 형식이 달라 파싱 결과가 비면 다른 버전으로 한 번 더
+            String cur = ytmGoodVer.get("search");
+            String alt = YTM_VER.equals(cur) ? ytmDynVer() : YTM_VER;
+            try {
+                JSONArray o2 = ytmParseSearch(new JSONObject(ytmCallWith("search", body, alt)), kind);
+                if (o2.length() > 0) { ytmGoodVer.put("search", alt); return o2; }
+            } catch (Exception ignored) { }
+        }
+        return out;
+    }
+
+    private JSONArray ytmParseSearch(JSONObject doc, String kind) throws Exception {
         JSONArray out = new JSONArray();
         java.util.HashSet<String> seen = new java.util.HashSet<>();
         for (Object o : ytmFind(doc, "musicResponsiveListItemRenderer")) {
